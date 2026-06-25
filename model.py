@@ -4,13 +4,14 @@ import torch.nn.functional as F
 import os
 from datetime import datetime
 from gin_model.Models import OCGIN
-from Losses import OCC_loss, InfoNCELoss
+from Losses import MultiCenterOCC_loss, InfoNCELoss
 from masknet_train import ParametricMaskNet
 
 
 class MergeModel(nn.Module):
     def __init__(self, dim_features, config1, device,
-                 num_chunks=4, threshold=0.5, alpha=0.2, beta=0.5, gamma=0.3):
+                 num_chunks=4, threshold=0.5, alpha=0.2, beta=0.5, gamma=0.3,
+                 num_centers=4, center_sep_weight=0.05):
         super(MergeModel, self).__init__()
         self.device = device
         self.num_chunks = num_chunks
@@ -18,6 +19,7 @@ class MergeModel(nn.Module):
         self.alpha = alpha
         self.beta = beta
         self.gamma = gamma
+        self.num_centers = num_centers
 
         self.gin_features = OCGIN(dim_features, config1).to(device)
         self.llama_proj = nn.Linear(
@@ -37,11 +39,13 @@ class MergeModel(nn.Module):
 
         self.classifier = nn.Linear(self.total_dim, 2)
         self.info_nce_loss = InfoNCELoss()
-        self.occ_loss = OCC_loss()
+        self.occ_loss = MultiCenterOCC_loss(margin=1.0, center_sep_weight=center_sep_weight)
 
-        self.center = nn.Parameter(torch.empty(1, self.total_dim), requires_grad=True)
-        nn.init.normal_(self.center, mean=0, std=0.1)
-        self.center.data = self.center.data.to(device)
+        # Multiple learnable centers (mixture of hyperspheres) instead of one
+        # global center. Each sample is judged against its *nearest* center.
+        self.centers = nn.Parameter(torch.empty(self.num_centers, self.total_dim), requires_grad=True)
+        nn.init.normal_(self.centers, mean=0, std=0.1)
+        self.centers.data = self.centers.data.to(device)
 
         self.tau = 1.0
         self.epsilon = 1e-8
@@ -60,12 +64,49 @@ class MergeModel(nn.Module):
         self.epsilon_decay = 1000
         self.global_step = 0
 
+        # Annealing schedule for the soft multi-center responsibility temperature.
+        # anneal_factor goes from 1.0 (fully soft, stable early training) down to
+        # center_anneal_end (sharper / more specialized centers later in training).
+        self.center_anneal_start = 1.0
+        self.center_anneal_end = 0.2
+        self.center_anneal_decay = 1000
+        self.center_anneal_step = 0
+
         self.log_probs = []
         self.rewards = []
 
     def split_chunks(self, x):
         assert x.size(1) % self.num_chunks == 0
         return x.view(x.size(0), self.num_chunks, -1)
+
+    def _get_center_anneal_factor(self, advance=True):
+        """
+        Returns the current annealing factor (1.0 = fully soft routing,
+        center_anneal_end = sharper/near-hard routing) and optionally advances
+        the internal step counter. Decays exponentially, mirroring _get_epsilon.
+        """
+        factor = self.center_anneal_end + (self.center_anneal_start - self.center_anneal_end) * \
+            torch.exp(torch.tensor(-self.center_anneal_step / self.center_anneal_decay,
+                                    device=self.device)).item()
+        if advance:
+            self.center_anneal_step += 1
+        return factor
+
+    def _soft_center(self, x, anneal_factor=None):
+        """
+        Soft multi-center read-out for a batch of embeddings x [B, D].
+
+        Returns:
+            soft_dist     [B]    - responsibility-weighted distance to centers
+            weighted_ctr  [B, D] - responsibility-weighted blend of all centers
+                                   (the "soft nearest center" vector per sample)
+            weights       [B, K] - soft responsibility distribution per sample
+        """
+        if anneal_factor is None:
+            anneal_factor = self._get_center_anneal_factor(advance=False)
+        soft_dist, weights, _ = self.occ_loss.soft_assign(x, self.centers, anneal_factor)
+        weighted_ctr = weights @ self.centers  # [B, D]
+        return soft_dist, weighted_ctr, weights
 
     def compute_covariance_loss(self, x, y):
         x = x - x.mean(dim=0, keepdim=True)
@@ -95,13 +136,17 @@ class MergeModel(nn.Module):
         return g_new, t_new
 
     def compute_confidence(self, g_new, t_new):
-        center_expanded = self.center.expand_as(g_new)
-        dist_g = torch.norm(g_new - center_expanded, p=2, dim=1)
-        dist_t = torch.norm(t_new - center_expanded, p=2, dim=1)
+        dist_g, _, _ = self._soft_center(g_new)
+        dist_t, _, _ = self._soft_center(t_new)
         delta = torch.abs(dist_g - dist_t) / (dist_g + dist_t + self.epsilon)
         return 1 - delta
 
-    def compute_center(self, dataloader, device):
+    def compute_centers(self, dataloader, device):
+        """
+        Initializes the K centers by running k-means over all combined
+        embeddings produced by the current model (replaces the old single
+        mean-center computation).
+        """
         self.eval()
         all_embeddings = []
 
@@ -121,9 +166,37 @@ class MergeModel(nn.Module):
                 combined_emb = (g_new + t_new) / 2
                 all_embeddings.append(combined_emb)
 
-        if all_embeddings:
-            all_embeddings = torch.cat(all_embeddings, dim=0)
-            self.center.data = all_embeddings.mean(dim=0, keepdim=True)
+        if not all_embeddings:
+            return
+
+        all_embeddings = torch.cat(all_embeddings, dim=0)  # [N, D]
+        n_samples = all_embeddings.size(0)
+        k = min(self.num_centers, max(1, n_samples))
+
+        # simple torch-native k-means (avoids extra sklearn dependency on tensors)
+        perm = torch.randperm(n_samples, device=all_embeddings.device)
+        centers = all_embeddings[perm[:k]].clone()
+
+        n_iters = 25
+        for _ in range(n_iters):
+            dist_matrix = torch.cdist(all_embeddings, centers, p=2)  # [N, k]
+            assignments = dist_matrix.argmin(dim=1)  # [N]
+            new_centers = centers.clone()
+            for c in range(k):
+                mask = assignments == c
+                if mask.any():
+                    new_centers[c] = all_embeddings[mask].mean(dim=0)
+            if torch.allclose(new_centers, centers, atol=1e-6):
+                centers = new_centers
+                break
+            centers = new_centers
+
+        if k < self.num_centers:
+            # pad with re-sampled points if we had fewer unique samples than centers
+            pad_idx = torch.randint(0, n_samples, (self.num_centers - k,), device=all_embeddings.device)
+            centers = torch.cat([centers, all_embeddings[pad_idx]], dim=0)
+
+        self.centers.data = centers.to(device)
 
     def generate_pseudo_labels(self, graph_data, llama_emb):
         self.eval()
@@ -154,9 +227,14 @@ class MergeModel(nn.Module):
 
         h_t = outputs_1[true_news_mask]
         z_t = outputs_2[true_news_mask]
-        theta = self.center.expand(h_t.shape[0], -1)
-        r_gnn_per_sample = F.cosine_similarity(h_t, theta, dim=1)
-        r_llm_per_sample = F.cosine_similarity(z_t, theta,dim=1)
+
+        # Each sample compares against its own soft (responsibility-weighted)
+        # blend of centers rather than a single hard-nearest or global center.
+        _, theta_h, _ = self._soft_center(h_t)
+        _, theta_z, _ = self._soft_center(z_t)
+
+        r_gnn_per_sample = F.cosine_similarity(h_t, theta_h, dim=1)
+        r_llm_per_sample = F.cosine_similarity(z_t, theta_z, dim=1)
 
         r_gnn = r_gnn_per_sample.mean()
         r_llm = r_llm_per_sample.mean()
@@ -210,8 +288,9 @@ class MergeModel(nn.Module):
 
         occ = 0.0
         if labels is not None:
-            occ = w_gnn * self.occ_loss(g_new, labels, self.center) + \
-                  w_llm * self.occ_loss(t_new, labels, self.center)
+            anneal_factor = self._get_center_anneal_factor(advance=True)
+            occ = w_gnn * self.occ_loss(g_new, labels, self.centers, anneal_factor=anneal_factor) + \
+                  w_llm * self.occ_loss(t_new, labels, self.centers, anneal_factor=anneal_factor)
 
         cov_loss = self.compute_covariance_loss(g_new, t_new)
         total_loss = self.alpha * info_nce_loss + \
